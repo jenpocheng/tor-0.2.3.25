@@ -40,6 +40,7 @@
 #include <openssl/asn1.h>
 #include <openssl/bio.h>
 #include <openssl/opensslv.h>
+#include <openssl/hmac.h>
 
 #ifdef USE_BUFFEREVENTS
 #include <event2/bufferevent_ssl.h>
@@ -1363,8 +1364,8 @@ tor_tls_client_is_using_v2_ciphers(const SSL *ssl, const char *address)
 static void
 tor_tls_debug_state_callback(const SSL *ssl, int type, int val)
 {
-  log_debug(LD_HANDSHAKE, "SSL %p is now in state %s [type=%d,val=%d].",
-            ssl, SSL_state_string_long(ssl), type, val);
+  log_debug(LD_HANDSHAKE, "SSL %p is now in state %x|%s [type=%d,val=%d].",
+            ssl, ssl->state, SSL_state_string_long(ssl), type, val);
 }
 
 /** Invoked when we're accepting a connection on <b>ssl</b>, and the connection
@@ -1806,6 +1807,791 @@ tor_tls_write(tor_tls_t *tls, const char *cp, size_t n)
   return err;
 }
 
+/* ------------------ client puzzle scheme ------------------------- */
+#define MAX_PUZZLE_LENGTH 50 /* puzzle handshake packet size */
+#define N_puzzle 1 /* the length in bytes of the unknown random bits in the puzzle*/ 
+
+#define s2n(s,c)        ((c[0]=(unsigned char)(((s)>> 8)&0xff), \
+                          c[1]=(unsigned char)(((s)    )&0xff)),c+=2)
+#define n2s(c,s)        ((s=(((unsigned int)(c[0]))<< 8)| \
+                            (((unsigned int)(c[1]))    )),c+=2)
+
+int
+ssl3_setup_read_buffer(SSL *s)
+{
+	unsigned char *p; 
+        if (s->s3->rbuf.buf == NULL) {
+        	if ((p=OPENSSL_malloc(MAX_PUZZLE_LENGTH)) == NULL)
+        		goto err;
+        	s->s3->rbuf.buf = p;
+        	s->s3->rbuf.len = MAX_PUZZLE_LENGTH;
+	}
+	s->packet= &(s->s3->rbuf.buf[0]);
+	return 1;
+err:
+	SSLerr(SSL_F_SSL3_SETUP_READ_BUFFER,ERR_R_MALLOC_FAILURE);
+	return 0;
+}
+
+int
+ssl3_setup_write_buffer(SSL *s)
+{
+        unsigned char *p;
+        if (s->s3->wbuf.buf == NULL) {
+                if ((p=OPENSSL_malloc(MAX_PUZZLE_LENGTH)) == NULL)
+                        goto err;
+                s->s3->wbuf.buf = p;
+                s->s3->wbuf.len = MAX_PUZZLE_LENGTH;
+        }
+        return 1;
+err:
+        SSLerr(SSL_F_SSL3_SETUP_WRITE_BUFFER,ERR_R_MALLOC_FAILURE);
+        return 0;
+}
+
+int
+ssl3_setup_buffers(SSL *s)
+{
+	if (!ssl3_setup_read_buffer(s)) return 0;
+	if (!ssl3_setup_write_buffer(s)) return 0;
+        return 1;
+}
+
+/* if s->s3->wbuf.left != 0, we need to call this */
+int ssl3_write_pending(SSL *s, int type, const unsigned char *buf, unsigned int len)
+{
+        int i;
+        SSL3_BUFFER *wb=&(s->s3->wbuf);
+        for (;;) {
+                errno = 0;
+                if (s->wbio != NULL) {
+                        s->rwstate=SSL_WRITING;
+                        i=BIO_write(s->wbio,(char *)&(wb->buf[wb->offset]),
+                                    (unsigned int)wb->left);
+                        log_debug(LD_HANDSHAKE, "BIO_write = %d", i);
+                } else {
+                        SSLerr(SSL_F_SSL3_WRITE_PENDING,SSL_R_BIO_NOT_SET);
+                        i= -1;
+                }
+                if (i == wb->left) {
+                        wb->left=0;
+                        wb->offset+=i;
+                        if (s->mode & SSL_MODE_RELEASE_BUFFERS &&
+                            SSL_version(s) != DTLS1_VERSION && SSL_version(s) != DTLS1_BAD_VER) {
+                                if (s->s3->wbuf.buf != NULL) {
+                                        OPENSSL_free(s->s3->wbuf.buf);
+                                        s->s3->wbuf.buf = NULL;
+                                }
+                        }
+                        s->rwstate=SSL_NOTHING;
+                        return(s->s3->wpend_ret);
+                }
+                wb->offset+=i;
+                wb->left-=i;
+        }
+}
+
+static int
+do_ssl3_write(SSL *s, int type, const unsigned char *buf, unsigned int len)
+{
+        unsigned char *p,*plen;
+        long align=0;
+        SSL3_RECORD *wr;
+        SSL3_BUFFER *wb=&(s->s3->wbuf);
+        if (wb->buf == NULL)
+                if (!ssl3_setup_write_buffer(s))
+                        return -1;
+
+        /* first check if there is a SSL3_BUFFER still being written
+         * out.  This will happen with non blocking IO */
+        if (wb->left != 0) {
+                return(ssl3_write_pending(s,type,buf,len));
+        }
+        wr= &(s->s3->wrec);
+#if defined(SSL3_ALIGN_PAYLOAD) && SSL3_ALIGN_PAYLOAD!=0
+        align = (long)wb->buf + SSL3_RT_HEADER_LENGTH;
+        align = (-align)&(SSL3_ALIGN_PAYLOAD-1);
+#endif
+        p = wb->buf + align;
+        wb->offset  = align;
+
+        /* write the header */
+        *(p++)=type&0xff;
+        wr->type=type;
+        *(p++)=(s->version>>8);
+        *(p++)=s->version&0xff;
+
+        /* field where we are to write out packet length */
+        plen=p;
+        p+=2;
+
+        /* lets setup the record stuff. */
+        wr->data=p;
+        wr->length=(int)len;
+        wr->input=(unsigned char *)buf;
+        /* we now 'read' from wr->input, wr->length bytes into wr->data */
+        /* we do not compress */
+        memcpy(wr->data,wr->input,wr->length);
+        wr->input=wr->data;
+        /* record length after mac and block padding */
+        s2n(wr->length,plen);
+        wr->type=type; /* not needed but helps for debugging */
+        wr->length += SSL3_RT_HEADER_LENGTH;
+        /* now let's set up wb */
+        wb->left = wr->length;
+        /* memorize argumeddnts so that ssl3_write_pending can detect bad write retries later */
+        s->s3->wpend_ret=len;
+        /* we now just need to write the buffer */
+        return ssl3_write_pending(s,type,buf,len);
+}
+
+/* Call this to write data in records of type 'type'
+ * It will return <= 0 if not all data has been sent or non-blocking IO.
+ */
+int
+ssl3_write_bytes(SSL *s, int type, const void *buf_, int len)
+{
+        const unsigned char *buf=buf_;
+        unsigned int tot, n;
+        int i;
+        s->rwstate=SSL_NOTHING;
+        tot=s->s3->wnum;
+        s->s3->wnum=0;
+        n=(len-tot);
+        for (;;) {
+                i = do_ssl3_write(s, type, &(buf[tot]), n);
+                if (i <= 0) {
+                        s->s3->wnum=tot;
+                        return i;
+                }
+                if ((i == (int)n) || (type == SSL3_RT_APPLICATION_DATA &&
+                        (s->mode & SSL_MODE_ENABLE_PARTIAL_WRITE))) {
+                        return tot+i;
+                }
+                n-=i;
+                tot+=i;
+        }
+}
+
+int ssl3_read_n (SSL *s, int n, int max, int extend)
+{
+        /* If extend == 0, obtain new n-byte packet; if extend == 1, increase
+         * packet by another n bytes.
+         * The packet will be in the sub-array of s->s3->rbuf.buf specified
+         * by s->packet and s->packet_length.
+         */
+        int i,len,left;
+        long align=0;
+        unsigned char *pkt;
+        SSL3_BUFFER *rb;
+
+        if (n <= 0) return n;
+        rb = &(s->s3->rbuf);
+        if (rb->buf == NULL)
+                if (!ssl3_setup_read_buffer(s))
+                        return -1;
+        left  = rb->left;
+#if defined(SSL3_ALIGN_PAYLOAD) && SSL3_ALIGN_PAYLOAD!=0
+        align = (long)rb->buf + SSL3_RT_HEADER_LENGTH;
+        align = (-align)&(SSL3_ALIGN_PAYLOAD-1);
+#endif
+        if (!extend) {
+                /* start with empty packet ... */
+                tor_assert(left == 0);                
+                rb->offset = align;
+                s->packet = rb->buf + rb->offset;
+                s->packet_length = 0;
+        }
+        /* if there is enough in the buffer from a previous read, take some */
+        if (left >= n) {
+                s->packet_length+=n;
+                rb->left=left-n;
+                rb->offset+=n;
+                return(n);
+        }
+        /* else we need to read more data */
+        len = s->packet_length;
+        pkt = rb->buf+align;
+        /* Move any available bytes to front of buffer */
+        tor_assert(s->packet == pkt);       
+        while (left < n) {
+                /* Now we have len+left bytes at the front of s->s3->rbuf.buf
+                 * and need to read in more until we have len+n */
+                errno = 0;
+                if (s->rbio != NULL) {
+                        s->rwstate=SSL_READING;
+                        i=BIO_read(s->rbio,pkt+len+left, n-left);
+                        log_debug(LD_HANDSHAKE, "BIO_read: %d",i );
+                } else {
+                        SSLerr(SSL_F_SSL3_READ_N,SSL_R_READ_BIO_NOT_SET);
+                        i = -1;
+                }
+                if (i <= 0) {
+                        rb->left = left;
+			if (len+left == 0) {
+                        	if (s->s3->rbuf.buf != NULL) {
+                                        OPENSSL_free(s->s3->rbuf.buf);
+                                        s->s3->rbuf.buf = NULL;
+                                }
+                        }
+                        return(i);
+                }
+                left+=i;
+        }
+        /* done reading, now the book-keeping */
+        rb->offset += n;
+        rb->left = left - n;
+        s->packet_length += n;
+        s->rwstate=SSL_NOTHING;
+        return(n);
+}
+
+/* Call this to get a new input record.
+ * It will return <= 0 if more data is needed, normally due to an error
+ * or non-blocking IO.
+ * When it finishes, one packet has been decoded and can be found in
+ * ssl->s3->rrec.type    - is the type of record
+ * ssl->s3->rrec.data,   - data
+ * ssl->s3->rrec.length, - number of bytes
+ */
+/* used only by ssl3_read_bytes */
+static int 
+ssl3_get_record(SSL *s)
+{
+        int ssl_major,ssl_minor;
+        int n,i= -1;
+        SSL3_RECORD *rr;
+        unsigned char *p;
+        short version;
+        rr= &(s->s3->rrec);
+again:
+        /* check if we have the header */
+        if ((s->rstate != SSL_ST_READ_BODY) || (s->packet_length < SSL3_RT_HEADER_LENGTH))
+        {
+                n=ssl3_read_n(s, SSL3_RT_HEADER_LENGTH, s->s3->rbuf.len, 0);
+                if (n <= 0) return(n); /* error or non-blocking */
+                s->rstate=SSL_ST_READ_BODY;
+                p=s->packet;
+                /* Pull apart the header into the SSL3_RECORD */
+                rr->type= *(p++);
+                ssl_major= *(p++);
+                ssl_minor= *(p++);
+                version=(ssl_major<<8)|ssl_minor;
+                n2s(p,rr->length);
+                /* Lets check version in the future */
+        }
+        /* s->rstate == SSL_ST_READ_BODY, get and decode the data */
+        if (rr->length > s->packet_length-SSL3_RT_HEADER_LENGTH) {
+                /* now s->packet_length == SSL3_RT_HEADER_LENGTH */
+                i=rr->length;
+                n=ssl3_read_n(s,i,i,1);
+                if (n <= 0) return(n); /* error or non-blocking io */
+        }
+        s->rstate=SSL_ST_READ_HEADER; /* set state for later operations */
+        /* At this point, s->packet_length == SSL3_RT_HEADER_LNGTH + rr->length,
+         * and we have that many bytes in s->packet
+         */
+        rr->data = &(s->packet[SSL3_RT_HEADER_LENGTH]);
+        /* we have pulled in a full packet so zero things */
+        rr->off = 0;
+        s->packet_length=0;
+        /* just read a 0 length packet */
+        if (rr->length == 0) goto again;
+        return(1);
+}
+
+int 
+puzzle_read_bytes(SSL *s, int type, unsigned char *buf, int len)
+{
+        int ret;
+        unsigned int n;
+        SSL3_RECORD *rr;
+
+        if (s->s3->rbuf.buf == NULL) /* Not initialized yet */
+                if (!ssl3_setup_read_buffer(s))
+                        return(-1);
+        s->rwstate=SSL_NOTHING;
+        rr = &(s->s3->rrec);
+
+        /* get new packet if necessary */
+	if ((rr->length == 0) || (s->rstate == SSL_ST_READ_BODY)) {
+                ret = ssl3_get_record(s);
+                if (ret <= 0) return(ret);
+        }
+        if (type == rr->type) /* SSL3_RT_APPLICATION_DATA or SSL3_RT_HANDSHAKE */
+        {
+                if (len <= 0) return(len);
+                if ((unsigned int)len > rr->length)
+                        n = rr->length;
+                else
+                        n = (unsigned int)len;
+                memcpy(buf,&(rr->data[rr->off]),n);
+		rr->length-=n;
+		rr->off+=n;
+		if (rr->length == 0) {
+			s->rstate=SSL_ST_READ_HEADER;
+			rr->off=0;
+			if (s->s3->rbuf.buf != NULL) {
+                               	OPENSSL_free(s->s3->rbuf.buf);
+				s->s3->rbuf.buf = NULL;
+			}
+                }
+		return(n);
+        }
+        log_debug(LD_HANDSHAKE, "Error: handle unexpected hanshake message");
+        return -1;
+}
+
+/* ------------------ server-side ------------------------- */
+#define l2n(l,c) 	(*((c)++)=(unsigned char)(((l)>>24)&0xff), \
+                         *((c)++)=(unsigned char)(((l)>>16)&0xff), \
+                         *((c)++)=(unsigned char)(((l)>> 8)&0xff), \
+                         *((c)++)=(unsigned char)(((l)    )&0xff))
+
+#define PUZZLE_SRVR_A 		0x4321
+#define PUZZLE_SRVR_B 		0x4322
+#define PUZZLE_DONE 		0x1236
+
+int 
+server_get_client_hello(SSL *s)
+{
+	long n;
+	unsigned char *p,*d;
+	if (s->state == SSL3_ST_SR_CLNT_HELLO_A)
+		s->state=SSL3_ST_SR_CLNT_HELLO_B;
+	// not sure if we really need this
+	unsigned char *buf=(unsigned char *)s->init_buf->data;
+	int type = SSL3_RT_HANDSHAKE;
+	n = puzzle_read_bytes(s, type, buf, 42);
+	if (n <= 0) return((int)n);
+	d=p=(unsigned char *)s->init_buf->data;
+	log_debug(LD_HANDSHAKE, "type: %x", *(p++));
+	log_debug(LD_HANDSHAKE, "len: %d", *(p++));
+	log_debug(LD_HANDSHAKE, "mark: %x", *(p++));
+	log_debug(LD_HANDSHAKE, "mark: %x", *(p++));
+	p += 2; /* skip version */
+	/* load the client random */
+	memcpy(s->s3->client_random,p,SSL3_RANDOM_SIZE);
+	return 1;
+	
+}
+
+int 
+server_send_server_puzzle(SSL *s)
+{
+	unsigned long Time, l;
+	unsigned char *p, *d, *buf;
+	
+	if (s->state == SSL3_ST_SW_SRVR_HELLO_A)
+	{
+		d=s->s3->client_random;
+		p=s->s3->server_random;
+		Time=(unsigned long)time(NULL);	/* Time */
+		l2n(Time,p);
+		if (RAND_pseudo_bytes(p,SSL3_RANDOM_SIZE-4) <= 0)
+			goto err;
+		
+		unsigned int len;
+		unsigned char in[32+4];
+		unsigned char out[32];
+		memcpy(	    in, d, SSL3_RANDOM_SIZE);		
+		memset(&in[32], s->s3->server_random[10], 1);
+		memset(&in[33], s->s3->server_random[11], 1);
+		memset(&in[34], s->s3->server_random[12], 1);
+		HMAC_CTX ctx;
+		HMAC_Init(&ctx, d, 32, EVP_sha256());
+		HMAC_Update(&ctx, in, 32 + N_puzzle);
+		HMAC_Final(&ctx, out, &len);
+		HMAC_cleanup(&ctx); /* Remove key from memory */
+
+		/* Do the message type and length last */
+		buf = (unsigned char *)s->init_buf->data;
+		d=p= &(buf[4]);
+		*(p++) = s->version>>8;
+		*(p++) = s->version&0xff;
+
+		/* Random stuff */
+		memcpy(p,out,SSL3_RANDOM_SIZE);
+		p += SSL3_RANDOM_SIZE;
+		
+		*(p++) = N_puzzle; /* the length of the unknown random bits in the puzzle */
+		s->references = N_puzzle; /* the length of the unknown random bits in the puzzle */
+		memset(p, '\0', 3);
+		p+=3;
+		
+		l=(p - d);
+		d=buf;
+		*(d++) = 0x99;
+		*(d++) = l;
+		*(d++) = 0x00;		
+		*(d++) = 0x02;
+		s->state=SSL3_ST_SW_SRVR_HELLO_B;
+		/* number of bytes to write */
+		s->init_num=p-buf;
+		s->init_off=0;
+	}
+	int type = SSL3_RT_HANDSHAKE;	
+	int ret = ssl3_write_bytes(s, type, &s->init_buf->data[s->init_off],
+				   s->init_num);
+	if (ret < 0) goto err;
+	tor_assert(ret == s->init_num);				
+	return(1);
+err:
+	return -1;
+}
+
+int 
+server_get_client_answer(SSL *s)
+{
+	long n;
+	unsigned char *p,*d;
+	if (s->state == PUZZLE_SRVR_A)
+		s->state = PUZZLE_SRVR_B;
+	// not sure if we really need this
+	unsigned char *buf=(unsigned char *)s->init_buf->data;
+	int type = SSL3_RT_HANDSHAKE;
+	n = puzzle_read_bytes(s, type, buf, 42);
+	if (n <= 0) return((int)n);
+
+	d=p=(unsigned char *)s->init_buf->data;
+	log_debug(LD_HANDSHAKE, "type: %x", *(p++));
+	log_debug(LD_HANDSHAKE, "len: %d", *(p++));
+	unsigned char sol = *p;
+	log_debug(LD_HANDSHAKE, "mark: %x", *(p++));
+	log_debug(LD_HANDSHAKE, "mark: %x", *(p++));
+	p += 2; /* skip version */
+	p += SSL3_RANDOM_SIZE;
+	
+	int isMatch = 0;
+	int i = 0;
+	int N = *(p++);
+	while(N--) {
+		if (s->s3->server_random[10+i] != *(p++))
+			isMatch++;
+		++i;
+	}
+	if ((N != s->references) || isMatch) {
+		log_debug(LD_HANDSHAKE, "puzzle handshake fail");	
+		return -1;
+	}
+	log_debug(LD_HANDSHAKE, "puzzle handshake success");
+	s->state=PUZZLE_DONE;
+	return 1;
+}
+
+int 
+puzzle_accept(SSL *s)
+{
+	BUF_MEM *buf;
+	void (*cb)(const SSL *ssl,int type,int val)=NULL;
+	int ret= -1;	
+	ERR_clear_error();
+	errno = 0;
+	if (s->info_callback != NULL)
+		cb=s->info_callback;
+	else if (s->ctx->info_callback != NULL)
+		cb=s->ctx->info_callback;		
+	for (;;) {
+		switch (s->state)
+		{
+		case SSL_ST_BEFORE:
+		case SSL_ST_ACCEPT:
+		case SSL_ST_BEFORE|SSL_ST_ACCEPT:
+		case SSL_ST_OK|SSL_ST_ACCEPT:
+			s->server=1;
+			if (cb != NULL) cb(s,SSL_CB_HANDSHAKE_START,1);
+			if ((s->version>>8) != 3)
+				{
+				SSLerr(SSL_F_SSL3_ACCEPT, ERR_R_INTERNAL_ERROR);
+				return -1;
+				}
+			s->type=SSL_ST_ACCEPT;
+
+			if (s->init_buf == NULL) {
+				if ((buf=BUF_MEM_new()) == NULL) {ret= -1; goto end;}
+				if (!BUF_MEM_grow(buf,SSL3_RT_MAX_PLAIN_LENGTH))
+					{ ret= -1; goto end;}
+				s->init_buf = buf;
+			}
+
+			if (!ssl3_setup_buffers(s)) { ret= -1; goto end; }
+			s->state=SSL3_ST_SR_CLNT_HELLO_A;
+			s->ctx->stats.sess_accept++;
+			s->init_num=0;
+			break;
+		case SSL3_ST_SR_CLNT_HELLO_A:
+		case SSL3_ST_SR_CLNT_HELLO_B:
+			s->shutdown=0;
+			ret= server_get_client_hello(s);
+			if (ret <= 0) goto end;
+			s->state=SSL3_ST_SW_SRVR_HELLO_A;
+			s->init_num=0;
+			break;
+		case SSL3_ST_SW_SRVR_HELLO_A:
+		case SSL3_ST_SW_SRVR_HELLO_B:
+			ret = server_send_server_puzzle(s);
+			if (ret <= 0) goto end;
+			s->state=PUZZLE_SRVR_A;
+			s->init_num=0;
+			break;			
+		case PUZZLE_SRVR_A:
+		case PUZZLE_SRVR_B:
+			s->shutdown=0;			
+			ret = server_get_client_answer(s);
+			if (ret <= 0) goto end;
+			break;			
+		case PUZZLE_DONE:
+			s->debug = 0;
+			SSL_clear(s);
+			SSL_set_accept_state(s);
+			return SSL_accept(s);			
+		default:
+			SSLerr(SSL_F_SSL3_ACCEPT,SSL_R_UNKNOWN_STATE);
+			ret= -1;
+			goto end;
+		}
+		if (cb != NULL) 
+			cb(s,SSL_CB_ACCEPT_LOOP,ret);
+	}
+end:
+	if (cb != NULL)
+		cb(s,SSL_CB_ACCEPT_EXIT,ret);
+	return(ret);
+}
+
+/* ------------------ client-side ------------------------- */
+#define PUZZLE_CLNT_A                  0x1234
+#define PUZZLE_CLNT_B                  0x1235
+#define PUZZLE_DONE                    0x1236
+
+int 
+client_send_client_hello(SSL *s)
+{
+	unsigned long Time, l;
+	unsigned char *p, *d, *buf;	
+
+	if (s->state == SSL3_ST_CW_CLNT_HELLO_A)
+	{
+		buf = (unsigned char *)s->init_buf->data;
+		p=s->s3->client_random;
+		Time=(unsigned long)time(NULL);	/* Time */
+		l2n(Time,p);
+		if (RAND_pseudo_bytes(p,SSL3_RANDOM_SIZE-4) <= 0)
+			goto err;
+		/* Do the message type and length last */
+		d=p= &(buf[4]);
+		*(p++) = s->version>>8;
+		*(p++) = s->version&0xff;
+
+		/* Random stuff */
+		memcpy(p,s->s3->client_random,SSL3_RANDOM_SIZE);
+		p += SSL3_RANDOM_SIZE;
+		/* reserved bits */
+		memset(p, '\0', 4);
+		p+=4;
+		l=(p-d);
+		d=buf;
+		*(d++) = 0x99; //SSL3_MT_CLIENT_HELLO;
+		*(d++) = l;
+		*(d++) = 0x00;
+		*(d++) = 0x01;	
+		s->state=SSL3_ST_CW_CLNT_HELLO_B;
+		/* number of bytes to write */
+		s->init_num=p-buf;
+		s->init_off=0;
+	}
+
+	int type = SSL3_RT_HANDSHAKE;	
+	int ret = ssl3_write_bytes(s, type, &s->init_buf->data[s->init_off],
+				   s->init_num);
+	if (ret < 0) goto err;
+	tor_assert(ret == s->init_num);			
+	return(1);
+err:
+	return -1;
+}
+
+int 
+client_get_server_puzzle(SSL *s)
+{
+	long n;
+	unsigned char *p,*d;
+	if (s->state == SSL3_ST_CR_SRVR_HELLO_A)
+		s->state = SSL3_ST_CR_SRVR_HELLO_B;
+	// not sure if we really need this
+	unsigned char *buf=(unsigned char *)s->init_buf->data;
+	int type = SSL3_RT_HANDSHAKE;
+	n = puzzle_read_bytes(s, type, buf, 42, 0);
+	if (n <= 0) return(-1);
+
+	d=p=(unsigned char *)s->init_buf->data;
+	log_debug(LD_HANDSHAKE, "type: %x", *(p++));
+	log_debug(LD_HANDSHAKE, "len: %d", *(p++));
+	log_debug(LD_HANDSHAKE, "mark: %x", *(p++));
+	log_debug(LD_HANDSHAKE, "mark: %x", *(p++));
+	p += 2; /* skip version */
+	/* load the server puzzle*/
+	memcpy(s->s3->server_random,p,SSL3_RANDOM_SIZE);
+	p += SSL3_RANDOM_SIZE;
+	s->references = *p; /* the length of the unknown random bits in the puzzle */
+	return 1;
+}
+
+int 
+client_send_client_answer(SSL *s)
+{
+	unsigned long l = 0;
+	unsigned char *p, *d, *buf;
+
+	if (s->state == PUZZLE_CLNT_A) {
+		p=s->s3->client_random;
+		d=s->s3->server_random;
+		/* solve the puzzle */
+		unsigned char in[32+4];
+		unsigned char out[32];
+		memcpy(in, p, SSL3_RANDOM_SIZE);
+		int sol = 0;
+		int N = s->references;
+		int max_trial = 1 << (N*8);
+		unsigned int len;
+		do {
+			HMAC_CTX ctx;
+			HMAC_Init(&ctx, p, 32, EVP_sha256());			
+			memset(&in[32], (sol>>16)&0xff, 1);
+			memset(&in[33],  (sol>>8)&0xff, 1);
+			memset(&in[34],       sol&0xff, 1);
+			HMAC_Update(&ctx, in, 32+N);
+			HMAC_Final(&ctx, out, &len);
+			HMAC_Init(&ctx, 0, 0, 0);
+			HMAC_cleanup(&ctx);
+			tor_assert((++l) <= max_trial);
+			++sol;			
+		} while (memcmp(d, out, SSL3_RANDOM_SIZE));
+
+		buf = (unsigned char *)s->init_buf->data;
+		/* Do the message type and length last */
+		d=p= &(buf[4]);
+		*(p++) = s->version>>8;
+		*(p++) = s->version&0xff;
+		memcpy(p,s->s3->server_random,SSL3_RANDOM_SIZE);
+		p += SSL3_RANDOM_SIZE;
+		/* reserved bits */
+		*(p++) = N; /* the length of the unknown random bits in the puzzle */
+		--sol;
+		*(p++) = (sol>>16)&0xff;
+		*(p++) =  (sol>>8)&0xff;
+		*(p++) =       sol&0xff;						
+		
+		l=(p-d);
+		d=buf;
+		*(d++) = 0x99; //SSL3_MT_CLIENT_HELLO;
+		*(d++) = l;
+		*(d++) = 0x00;		
+		*(d++) = 0x03;						
+
+		s->state=PUZZLE_CLNT_B;
+		/* number of bytes to write */
+		s->init_num=p-buf;
+		s->init_off=0;
+	}
+
+	/* PUZZLE_CLNT_B */
+	int type = SSL3_RT_HANDSHAKE;	
+	int ret = ssl3_write_bytes(s, type, &s->init_buf->data[s->init_off],
+				   s->init_num);
+	if (ret < 0) goto err;
+	tor_assert(ret != s->init_num);		
+	return(1);
+err:
+	return -1;
+}
+
+int puzzle_connect(SSL *s)
+{
+	BUF_MEM *buf=NULL;
+	void (*cb)(const SSL *ssl,int type,int val)=NULL;
+	int ret= -1;
+	ERR_clear_error();
+	errno = 0;
+
+	if (s->info_callback != NULL)
+		cb=s->info_callback;
+	else if (s->ctx->info_callback != NULL)
+		cb=s->ctx->info_callback;
+	
+	for (;;) {
+		switch(s->state) {
+		case SSL_ST_BEFORE:
+		case SSL_ST_CONNECT:
+		case SSL_ST_BEFORE|SSL_ST_CONNECT:
+		case SSL_ST_OK|SSL_ST_CONNECT:
+			s->server=0;
+			if (cb != NULL) cb(s,SSL_CB_HANDSHAKE_START,1);
+			if ((s->version & 0xff00 ) != 0x0300) {
+				SSLerr(SSL_F_SSL3_CONNECT, ERR_R_INTERNAL_ERROR);
+				ret = -1;
+				goto end;
+			}				
+			/* s->version=SSL3_VERSION; */
+			s->type=SSL_ST_CONNECT;
+			if (s->init_buf == NULL) {
+				if ((buf=BUF_MEM_new()) == NULL) 
+					{ ret= -1; goto end; }
+				if (!BUF_MEM_grow(buf,SSL3_RT_MAX_PLAIN_LENGTH))
+					{ ret= -1; goto end; }
+				s->init_buf=buf;
+				buf=NULL;
+			}
+			if (!ssl3_setup_buffers(s)) { ret= -1; goto end; }
+			s->state=SSL3_ST_CW_CLNT_HELLO_A;
+			s->ctx->stats.sess_connect++;
+			s->init_num=0;
+			break;
+		case SSL3_ST_CW_CLNT_HELLO_A:
+		case SSL3_ST_CW_CLNT_HELLO_B:
+			s->shutdown=0;			
+			ret = client_send_client_hello(s);
+			if (ret <= 0) goto end;
+			s->state=SSL3_ST_CR_SRVR_HELLO_A;
+			s->init_num=0;
+			break;
+		case SSL3_ST_CR_SRVR_HELLO_A:
+		case SSL3_ST_CR_SRVR_HELLO_B:
+			ret = client_get_server_puzzle(s);
+			if (ret <= 0) goto end;
+			s->state = PUZZLE_CLNT_A;
+			s->init_num = 0;
+			break;
+		case PUZZLE_CLNT_A:
+		case PUZZLE_CLNT_B:
+			s->shutdown=0;			
+			ret = client_send_client_answer(s);
+			if (ret <= 0) goto end;
+			s->state=PUZZLE_DONE;
+			break;
+		case PUZZLE_DONE:
+			ret = -1;
+			s->debug = 0;
+			SSL_clear(s);
+			return SSL_connect(s);
+		default:
+			SSLerr(SSL_F_SSL3_CONNECT,SSL_R_UNKNOWN_STATE);
+			ret= -1;
+			goto end;
+		}
+		/* did we do anything */
+		if (cb != NULL)
+			cb(s,SSL_CB_CONNECT_LOOP,ret);
+	}
+end:
+	if (buf != NULL)
+		BUF_MEM_free(buf);
+	if (cb != NULL)
+		cb(s,SSL_CB_CONNECT_EXIT,ret);
+	return(ret);
+}
+
+
 /** Perform initial handshake on <b>tls</b>.  When finished, returns
  * TOR_TLS_DONE.  On failure, returns TOR_TLS_ERROR, TOR_TLS_WANTREAD,
  * or TOR_TLS_WANTWRITE.
@@ -1823,12 +2609,49 @@ tor_tls_handshake(tor_tls_t *tls)
   if (tls->isServer) {
     log_debug(LD_HANDSHAKE, "About to call SSL_accept on %p (%s)", tls,
               SSL_state_string_long(tls->ssl));
-    r = SSL_accept(tls->ssl);
-  } else {
+    log_debug(LD_HANDSHAKE, "now I call SSL_accept");
+    if (strncmp(tls->address, "\"128.59.23.176\"", 12) == 0) 
+    {
+      log_debug(LD_HANDSHAKE, "testing - IP address %s.", tls->address);
+      if (tls->ssl->debug == 1)
+        r = puzzle_accept(tls->ssl);
+      else if (tls->ssl->handshake_func == 0) {
+	SSL_set_accept_state(tls->ssl);
+	SSL_clear(tls->ssl);
+	tls->ssl->debug = 1;
+        r = puzzle_accept(tls->ssl);
+      } 
+      else
+        r = tls->ssl->method->ssl_accept(tls->ssl);
+    } 
+    else
+    {
+      r = SSL_accept(tls->ssl);
+    }
+  } else { // tls is not a server
     log_debug(LD_HANDSHAKE, "About to call SSL_connect on %p (%s)", tls,
               SSL_state_string_long(tls->ssl));
-    r = SSL_connect(tls->ssl);
+    log_debug(LD_HANDSHAKE, "now I call SSL_connect");
+    if (strncmp(tls->address, "\"128.59.23.176\"", 12) == 0)
+    {
+      log_debug(LD_HANDSHAKE, "testing - IP address %s.", tls->address);
+      if (tls->ssl->debug == 1)
+	r = puzzle_connect(tls->ssl);
+      else if (tls->ssl->handshake_func == 0) {
+        SSL_set_connect_state(tls->ssl);
+	SSL_clear(tls->ssl);
+	tls->ssl->debug = 1;
+	r = puzzle_connect(tls->ssl);
+      }
+      else
+	r = tls->ssl->method->ssl_connect(tls->ssl);	
+    }
+    else
+    {
+      r = SSL_connect(tls->ssl);      
+    }
   }
+  
   if (oldstate != tls->ssl->state)
     log_debug(LD_HANDSHAKE, "After call, %p was in state %s",
               tls, SSL_state_string_long(tls->ssl));
