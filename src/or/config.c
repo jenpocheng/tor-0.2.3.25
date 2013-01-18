@@ -397,7 +397,7 @@ static config_var_t _option_vars[] = {
   V(RunAsDaemon,                 BOOL,     "0"),
 //  V(RunTesting,                  BOOL,     "0"),
   OBSOLETE("RunTesting"), // currently unused
-  V(SafeLogging,                 STRING,   "1"),
+  V(SafeLogging,                 STRING,   "0"),
   V(SafeSocks,                   BOOL,     "0"),
   V(ServerDNSAllowBrokenConfig,  BOOL,     "1"),
   V(ServerDNSAllowNonRFC953Hostnames, BOOL,"0"),
